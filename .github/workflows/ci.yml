@@ -1,1 +1,207 @@
+name: build-sign-and-update-deploy
 
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: gitops-demo-app
+  REGISTRY: docker.io
+  DOCKERHUB_NAMESPACE: ${{ secrets.DOCKER_USER }}
+  IMAGE: docker.io/${{ secrets.DOCKER_USER }}/gitops-demo-app
+  DEPLOY_REPO: vinita-devops/gitops_repo
+  DEPLOY_BRANCH: main
+  APP_PATH: app
+
+jobs:
+  build_sign_update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write   # for keyless signing (cosign OIDC)
+      packages: write
+      pull-requests: write
+      security-events: write 
+    steps:
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+
+      - name: Set short SHA
+        id: meta
+        run: echo "short_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          
+      - name: Build and Push (tags- sha & latest)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: |
+            COMMIT_SHA=${{ steps.meta.outputs.short_sha }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.short_sha }}
+            ${{ env.IMAGE }}:latest
+          provenance: false
+          sbom: false
+
+      - name: Show built digest
+        run: echo "Digest is = ${{ steps.build.outputs.digest }}"
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0.17.9
+
+      - name: Generate SBOM (SPDX JSON)
+        run: |
+          syft packages . -o spdx-json=sbom.spdx.json
+        working-directory: ${{ env.APP_PATH }}
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.meta.outputs.short_sha }}
+          path: ${{ env.APP_PATH }}/sbom.spdx.json
+
+      
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.6.0
+
+      - name: Cosign sign (keyless via OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign --yes \
+            ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+
+      - name: Cosign attest SBOM
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign attest --yes \
+            --predicate ${{ env.APP_PATH }}/sbom.spdx.json \
+            --type spdx \
+            ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+
+        # (Optional) Verify we can fetch/verify the SBOM attestation
+      - name: Verify SBOM attestation
+        run: |
+          cosign verify-attestation \
+            --type spdx \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "https://github.com/UnpredictablePrashant/GitOpsDemoA/.*" \
+            ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+
+
+      - name: Install Trivy
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: 'image'
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+          format: 'sarif'
+          output: 'trivy.sarif'
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+
+
+
+      - name: Prepare deploy repo update
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEPLOY_REPO }}
+          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
+          ref: ${{ env.DEPLOY_BRANCH }}
+          path: deploy-repo
+          fetch-depth: 0
+      
+      - name: Install yq (v4)
+        run: |
+          YQ_VER=v4.44.3
+          curl -L "https://github.com/mikefarah/yq/releases/download/${YQ_VER}/yq_linux_amd64" -o /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Update image digest in deploy manifests (idempotent)
+        working-directory: deploy-repo
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          echo "Setting IMAGE_REF=${IMAGE_REF}"
+
+          # 1) Deployment: set containers[name==web].image = IMAGE_REF
+          yq -i '
+            (.spec.template.spec.containers[] | select(.name=="web")).image = env(IMAGE_REF)
+          ' k8s/deployment.yaml
+
+          # 2) PreSync Job for cosign and sbom: set the LAST arg of containers[name==cosign-verify] to IMAGE_REF
+          # (args: [..., "__IMAGE_REF__" or previous digest]) -> replace terminal element
+          yq -i '
+            (.spec.template.spec.containers[] | select(.name=="cosign-verify")).args |=
+            ( .[:-1] + [ env(IMAGE_REF) ] )
+          ' k8s/presync-verify.yaml
+          yq -i '
+            (.spec.template.spec.containers[] | select(.name=="verify-sbom")).args |=
+            ( .[:-1] + [ env(IMAGE_REF) ] )
+          ' k8s/presync-verify-sbom.yaml
+
+          echo "Diff after yq updates (if any):"
+          git status --porcelain
+          git --no-pager diff
+      
+      - name: Commit changes (only if any)
+        working-directory: deploy-repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage only if there are actual changes
+          if ! git diff --quiet; then
+            git add k8s/deployment.yaml k8s/presync-verify.yaml
+            git commit -m "chore: set image to ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+          else
+            echo "No manifest changes detected (same digest). Skipping PR creation."
+            echo "skip_pr=true" >> "$GITHUB_OUTPUT"
+          fi
+        id: commitcheck
+
+
+      - name: Open PR to deploy repo
+        if: steps.commitcheck.outputs.skip_pr != 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
+          path: deploy-repo
+          # Unique branch every run to avoid reusing an old one
+          branch: update-image-${{ steps.meta.outputs.short_sha }}-${{ github.run_number }}
+          base: ${{ env.DEPLOY_BRANCH }}
+          title: "Update image to ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+          commit-message: "chore: set image to ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+          body: |
+            - Image: `${{ env.IMAGE }}@${{ steps.build.outputs.digest }}`
+            - Signed with Cosign (keyless via OIDC).
+            - SBOM generated for commit `${{ steps.meta.outputs.short_sha }}`.
+          labels: ci
